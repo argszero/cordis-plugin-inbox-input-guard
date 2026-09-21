@@ -1,12 +1,26 @@
-fix: cope with a mount that passes no config object
+feat: sweep the pending lists too, and default the config argument
 
-The harness's own plugin tests mount with
-`ctx.plugin({ name, inject, apply })`, which carries no `Config` for Cordis to
-resolve — so `apply` received `undefined` and threw on the first property read.
-A bundle-patch loader mounts the module namespace instead, Cordis fills the
-schema defaults, and that path was already fine; only the object form failed.
+Two fixes on top of 0.1.0, both found by probing instead of by reasoning.
 
-`apply` now defaults its second parameter, which is also what the sibling
-@argszero plugin does. Both spellings are pinned by a new test, the installed
-probe exercises both, and the mutation that removes the default turns the suite
-red (16/16 mutations, 20/20 tests).
+The claimed batch is not the only surface a reader indexes. A value injected
+into `next-step` while a turn is running sits in `agent.inbox.nextStep` until the
+next claim takes it out, and `agent-instructions` walks that projection looking
+for its own baseline context, reading `message.source.kind` as it goes:
+
+  control   next-step injected mid-turn   THREW TypeError: reading 'kind'
+  guarded   next-step injected mid-turn   OK    nextStep=["msg"]
+
+The guard now sweeps both pending lists at its pre-step entry and repairs or
+drops through `inbox.splice`, the public primitive for a pending-list mutation.
+Each list is walked backwards, so removing one entry cannot shift the position of
+another still to be examined (a forward walk splices the wrong live index and
+leaves the raw value behind — pinned by a test and a mutation).
+
+Separately, `apply` now defaults its second parameter. The harness's own plugin
+tests mount with `ctx.plugin({ name, inject, apply })`, which carries no `Config`
+for Cordis to resolve, so `apply` received `undefined` and threw on the first
+property read; a bundle-patch loader mounts the module namespace and was already
+fine. Both spellings are pinned.
+
+Tests: 24 behaviour tests (three control arms, one per placement), 4 packaging
+invariants, 20/20 mutations of the built output red.

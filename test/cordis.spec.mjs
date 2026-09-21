@@ -35,6 +35,7 @@ import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import * as agentInstructions from '@deepseek-ai/dsh-agent-instructions'
 import * as timeContext from '@deepseek-ai/dsh-time-context'
 import * as plugin from '../lib/index.js'
 
@@ -60,6 +61,10 @@ async function mountBase() {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(timeContext)
+  // The second shipped reader of a claimed batch is also the only one that walks
+  // the *pending* lists directly: it filters `inbox.nextStep` for its own
+  // baseline context, and that filter reads `message.source.kind`.
+  await ctx.plugin(agentInstructions, { maxBytes: 1_000_000 })
   const harness = await mountAgentLoopTestHarness(ctx)
   const warnings = []
   ctx.logger.exporter({
@@ -169,6 +174,122 @@ test('the guard keeps the real reader working: the turn proceeds and returns its
   assert.equal(context.source.kind, 'plugin')
   assert.equal(context.source.plugin, 'time-context')
   assert.equal(guardApi(ctx).counts().repaired, 1)
+  await ctx.fiber.dispose()
+})
+
+test('control arm: a string injected into next-step mid-turn throws from the pending-list reader', async () => {
+  const { ctx, harness } = await mountBase()
+  const agent = await harness.create(SessionId('control-pending'))
+  // No claim covers this one: the value is put where the *next* step will look,
+  // while the current turn is running, and that reader indexes the projection.
+  const batch = harness.claim(agent, 'next-turn', 1)
+  agent.inbox.splice('next-step', 0, 0, [GARBAGE])
+  await assert.rejects(() => dispatch(ctx, agent, batch), (error) => {
+    assert.equal(error.message, CRASH)
+    return true
+  })
+  await ctx.fiber.dispose()
+})
+
+test('the pending sweep closes that path, and repairs the value in place', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  const agent = await harness.create(SessionId('pending-swept'))
+  const batch = harness.claim(agent, 'next-turn', 1)
+  agent.inbox.splice('next-step', 0, 0, [GARBAGE])
+
+  const decision = await dispatch(ctx, agent, batch)
+  assert.equal(decision.kind, 'enter')
+  // The projection that the reader walks now holds a message, not a string.
+  assert.equal(agent.inbox.nextStep.length, 1)
+  assert.equal(plugin.isUsableUserMessage(agent.inbox.nextStep[0]), true)
+  assert.deepEqual(agent.inbox.nextStep[0].content, [{ type: 'text', text: GARBAGE }])
+  assert.equal(agent.inbox.nextStep[0].source.plugin, plugin.name)
+
+  // Two records, because the value was seen twice: at the durable write, and
+  // here in the projection. That is the point of the durable half — the two
+  // entries are the same defect at two different moments.
+  assert.deepEqual(
+    guardApi(ctx).violations().map((entry) => `${entry.origin}:${entry.action}`),
+    ['durable:observed', 'pending:repaired'],
+  )
+  const [, violation] = guardApi(ctx).violations()
+  assert.equal(violation.target, 'next-step')
+  assert.equal(violation.valueKind, 'string')
+  // The repair is a durable mutation like any other, so the log records it.
+  const spliced = agent.session.snapshotEvents().filter((event) => event.type === 'agent/inbox/spliced')
+  assert.deepEqual(spliced.at(-1).data.inserted.map((message) => message.source?.plugin), [plugin.name])
+  await ctx.fiber.dispose()
+})
+
+test('the pending sweep walks each list in reverse, so no entry shifts past it', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  const agent = await harness.create(SessionId('pending-mixed'))
+  const batch = harness.claim(agent, 'next-turn', 1)
+  const legal = createUserMessage({
+    content: [{ type: 'text', text: 'waiting for the next step' }],
+    source: { kind: 'user' },
+  })
+  // Two offenders in ONE list, with a legal entry between them: the first one is
+  // removed (positions after it shift) and the last one is replaced. A forward
+  // walk would splice the wrong live index for the second and leave the number
+  // in place — which is why this ordering, not just the count, is asserted.
+  agent.inbox.splice('next-step', 0, 0, [{ id: 'p1', role: 'user' }, legal, 7])
+  // And one offender in the other list, so both branches are exercised.
+  agent.inbox.splice('next-turn', 0, 0, [{ id: 'p2', role: 'user' }])
+
+  await dispatch(ctx, agent, batch)
+  // Nothing a reader could index is left un-rendered, in either list. This is
+  // the assertion a forward walk fails: it splices the wrong live index for the
+  // last entry and leaves the raw number sitting in the list. (The list is not
+  // asserted to a fixed length: `agent-instructions` is mounted too, and its own
+  // listener syncs its baseline context into `next-step` after the entries.)
+  assert.equal(agent.inbox.nextStep.every(plugin.isUsableUserMessage), true)
+  assert.equal(agent.inbox.nextTurn.every(plugin.isUsableUserMessage), true)
+  // The number became its own text, and the legal message between the two
+  // offenders is still there.
+  const texts = agent.inbox.nextStep.map((message) => message.content[0]?.text)
+  assert.ok(texts.includes('7'), `the repaired number is present: ${JSON.stringify(texts)}`)
+  assert.ok(
+    agent.inbox.nextStep.some((message) => message.id === legal.id),
+    'the legal message between the two offenders is still pending',
+  )
+  const actions = guardApi(ctx).violations().map((entry) => `${entry.origin}:${entry.valueKind}:${entry.action}`)
+  // Three durable writes held a non-message (two in `next-step`, one in
+  // `next-turn`), and the sweep then handed each back at its own position.
+  assert.deepEqual(actions, [
+    'durable:object:observed', 'durable:number:observed', 'durable:object:observed',
+    'pending:number:repaired', 'pending:object:quarantined', 'pending:object:quarantined',
+  ])
+  await ctx.fiber.dispose()
+})
+
+test('the pending sweep leaves legal entries exactly where they were', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  const agent = await harness.create(SessionId('pending-legal'))
+  const batch = harness.claim(agent, 'next-turn', 1)
+  // Two distinct messages on purpose: the same identity in both lists is
+  // rejected by the inbox's own duplicate guard, which is a different rule.
+  const pending = createUserMessage({
+    content: [{ type: 'text', text: 'waiting for the next step' }],
+    source: { kind: 'user' },
+  })
+  const queued = createUserMessage({
+    content: [{ type: 'text', text: 'waiting for the next turn' }],
+    source: { kind: 'user' },
+  })
+  agent.inbox.splice('next-step', 0, 0, [pending])
+  agent.inbox.splice('next-turn', 0, 0, [queued])
+
+  await dispatch(ctx, agent, batch)
+  // Both legal entries are untouched and still pending (each list also gains
+  // whatever another mounted listener chooses to sync in; that is not this
+  // guard's business).
+  assert.ok(agent.inbox.nextStep.some((message) => message.id === pending.id))
+  assert.ok(agent.inbox.nextTurn.some((message) => message.id === queued.id))
+  assert.deepEqual(guardApi(ctx).violations(), [])
   await ctx.fiber.dispose()
 })
 

@@ -27,6 +27,13 @@
  *    own listener entry. Entries run outermost-first and every listener's
  *    `next()` continuation runs after all entries, so a reader that reads the
  *    batch after calling `next()` — every shipped reader — sees the repair.
+ * 2b. **At the pending lists.** The claimed batch is not the only place a reader
+ *    looks. `agent/inbox.nextStep` / `nextTurn` are projection reads, and a value
+ *    injected into `next-step` while a turn is running is visible there before
+ *    any claim takes it out — `agent-instructions`, for one, walks that list and
+ *    reads `message.source.kind`. The guard therefore sweeps both pending lists
+ *    at its entry too, repairing or dropping through `inbox.splice`, the public
+ *    primitive for a pending-list mutation.
  * 3. **On the durable write.** A `session/event` observer records every
  *    non-message that reaches `agent/inbox/spliced`, with the session, the log
  *    seq, the inbox list and a bounded rendering. This is the signal the report
@@ -80,8 +87,8 @@ export const API_NAME = 'inboxInputGuard'
 /** What the guard may do with an entry that is not a usable user message. */
 export type GuardMode = 'repair' | 'quarantine' | 'report'
 
-/** Where a violation was seen: in the durable log, or in a claimed batch. */
-export type ViolationOrigin = 'durable' | 'claimed'
+/** Where a violation was seen: committed to the log, still pending, or claimed. */
+export type ViolationOrigin = 'durable' | 'pending' | 'claimed'
 
 /** What the guard did about it. `observed` is also what the durable half does. */
 export type ViolationAction = 'repaired' | 'quarantined' | 'observed'
@@ -250,6 +257,20 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
   }
 
   /**
+   * The message one repaired scalar becomes: the producer's own text, with the
+   * repair recorded in the source so the transcript says where it came from.
+   */
+  const repairOf = (text: string, valueKind: string): UserMessage => createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: name,
+      form: 'notice',
+      summary: boundContextSummary(`repaired inbox input (${valueKind})`),
+    },
+  })
+
+  /**
    * Repair or drop every non-message in one batch, in place.
    *
    * In place on purpose: the array is the one the loop claimed and the one every
@@ -279,15 +300,7 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
       }
       const text = mode === 'repair' ? verbatimText(value) : undefined
       if (text !== undefined) {
-        batch[index] = createUserMessage({
-          content: [{ type: 'text', text }],
-          source: {
-            kind: 'plugin',
-            plugin: name,
-            form: 'notice',
-            summary: boundContextSummary(`repaired inbox input (${violation.valueKind})`),
-          },
-        })
+        batch[index] = repairOf(text, violation.valueKind)
         record({ ...violation, at: Date.now(), action: 'repaired' })
         continue
       }
@@ -298,6 +311,53 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
       batch.splice(index, 1)
       index -= 1
       record({ ...violation, at: Date.now(), action: 'quarantined' })
+    }
+  }
+
+  /**
+   * Repair or drop non-messages still sitting in the *pending* lists, which
+   * readers index directly rather than through a claimed batch.
+   *
+   * `agent/inbox/{nextStep,nextTurn}` are projection reads, and at least one
+   * shipped module walks them and touches `message.source.kind`
+   * (`agent-instructions` looks for its own baseline context). A value injected
+   * into `next-step` while a turn is running is therefore visible to that reader
+   * before any claim takes it out — the claim path alone does not cover it.
+   *
+   * Mutating through `inbox.splice` is the public primitive for exactly this,
+   * and it records the change durably like any other pending-list mutation. Each
+   * list is walked backwards so removing or replacing one entry cannot shift the
+   * position of another still to be examined.
+   */
+  const sanitizePending = (agent: Agent): void => {
+    for (const target of ['next-step', 'next-turn'] as const) {
+      const list: readonly unknown[] = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn
+      for (let index = list.length - 1; index >= 0; index -= 1) {
+        const value: unknown = list[index]
+        if (isUsableUserMessage(value)) continue
+        const violation: Omit<InboxViolation, 'action'> = {
+          at: Date.now(),
+          origin: 'pending',
+          sessionId: String(agent.session.id),
+          seq: null,
+          target,
+          index,
+          valueKind: valueKindOf(value),
+          preview: previewOf(value, previewChars),
+        }
+        const text = mode === 'repair' ? verbatimText(value) : undefined
+        if (text !== undefined) {
+          agent.inbox.splice(target, index, 1, [repairOf(text, violation.valueKind)])
+          record({ ...violation, action: 'repaired' })
+          continue
+        }
+        if (mode === 'report') {
+          record({ ...violation, action: 'observed' })
+          continue
+        }
+        agent.inbox.splice(target, index, 1, [])
+        record({ ...violation, action: 'quarantined' })
+      }
     }
   }
 
@@ -339,7 +399,11 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
 
   ctx.on('agent/pre-step', (payload, next) => {
     // An agent that predates this mount has no wrapped claim yet: its current
-    // batch is repaired here, and hooking it covers every later turn.
+    // batch is repaired here, and hooking it covers every later turn. The
+    // pending sweep runs first, because the modules that index the pending lists
+    // directly read them after their own `next()` — so a value injected into
+    // `next-step` mid-turn has to be gone from the projection by then.
+    sanitizePending(payload.agent)
     sanitize(payload.messages, 'claimed', String(payload.agent.session.id), null, null)
     hook(payload.agent)
     return next()

@@ -34,7 +34,7 @@ plugin that wrote the string. Nothing in the session names the actual mistake.
 
 ## What this plugin does
 
-Three halves, each independently useful:
+Four halves, each independently useful:
 
 1. **At the claim.** For every agent it can reach — through `agent/created`, and
    through the first `agent/pre-step` of an agent that predates the mount — it
@@ -43,7 +43,13 @@ Three halves, each independently useful:
    is handed messages.
 2. **At the pre-step entry.** A batch claimed before the mount is repaired in
    place at the guard's own entry point.
-3. **At the durable write.** A `session/event` observer records every
+3. **At the pending lists.** The claimed batch is not the only surface a reader
+   indexes. A value injected into `next-step` while a turn is running sits in
+   `agent/inbox.nextStep` — a projection read that `agent-instructions` walks
+   looking for its own baseline context — until the next claim takes it out. The
+   guard sweeps both pending lists at its entry and repairs or drops through
+   `inbox.splice`, the public primitive for a pending-list mutation.
+4. **At the durable write.** A `session/event` observer records every
    non-message that reaches `agent/inbox/spliced`, with the session, the log
    seq, the inbox list and a bounded rendering — the signal the report above did
    not have. The defect is named where it is committed, instead of surfacing
@@ -53,8 +59,8 @@ Three halves, each independently useful:
 
 | mode | a scalar (`string` / `number` / `boolean` / `bigint`) | anything else |
 |------|------------------------------------------------------|---------------|
-| `repair` (default) | delivered **verbatim** as a user message whose source records the repair | dropped from the batch |
-| `quarantine` | dropped from the batch | dropped from the batch |
+| `repair` (default) | delivered **verbatim** as a user message whose source records the repair | dropped |
+| `quarantine` | dropped | dropped |
 | `report` | untouched — the turn fails exactly as it would without the plugin | untouched |
 
 In `repair` mode the producer's own text still reaches the model, in a message
@@ -92,6 +98,9 @@ Each violation is also logged at warn level, naming the session and the log seq.
 
 - The durable `agent/inbox/spliced` record keeps whatever was spliced — a plugin
   cannot rewrite committed session history. This guard is the consumer-side half.
+- A plugin arrives after the fact, so the value is observed more than once: at
+  the durable write, again if it is still pending, and again if it is claimed.
+  Each observation is its own record, because the positions differ.
 - It cannot name the plugin that wrote the string: the inbox records a value, and
   a value does not carry a caller.
 - `report` mode re-observes the same untouched entry once per pass, so one bad
@@ -141,8 +150,9 @@ npm test
 
 Real Cordis, the real `AgentLoop`, a production agent with its real durable
 inbox, and the real `time-context` reader the report names. The suite includes a
-control arm that reproduces the reported crash with the plugin unmounted, and 16
-mutations of the built output, each of which turns the suite red.
+control arm for each placement that reproduces the reported crash with the
+plugin unmounted, and 20 mutations of the built output, each of which turns the
+suite red.
 
 `scripts/probe-installed.mjs` is the other half: it imports the *published*
 package by name from a directory where it was installed from the registry, and
