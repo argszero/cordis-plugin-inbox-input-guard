@@ -8,7 +8,12 @@
  *   npm i @argszero/cordis-plugin-inbox-input-guard \
  *         @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-agent-loop-testkit \
  *         @deepseek-ai/dsh-time-context
- *   node <this-repo>/scripts/probe-installed.mjs
+ *   cp <this-repo>/scripts/probe-installed.mjs . && node probe-installed.mjs
+ *
+ * The copy is required, not cosmetic: Node self-references a package by its own
+ * `name` for any module living under that package's root, so running the file
+ * from this repository resolves the import to `lib/` here and trips the guard
+ * below. Running the copy resolves through the install directory instead.
  *
  * Both mount spellings are exercised, because they differ: a bundle-patch loader
  * mounts the module namespace and Cordis resolves the exported `Config`, while
@@ -43,7 +48,7 @@ if (resolved === join(here, 'lib', 'index.js')) {
   console.error(
     'This probe must run where the package was installed from the registry, not in its own tree:\n'
     + '  mkdir -p /tmp/probe && cd /tmp/probe && npm i @argszero/cordis-plugin-inbox-input-guard\n'
-    + '  node ' + fileURLToPath(import.meta.url) + '\n'
+    + '  cp ' + fileURLToPath(import.meta.url) + ' . && node probe-installed.mjs\n'
     + `Resolved to: ${resolved}`,
   )
   process.exit(2)
@@ -124,7 +129,7 @@ const checks = {
 }
 console.log(JSON.stringify({
   plugin: plugin.name,
-  version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
+  version: JSON.parse(readFileSync(join(dirname(resolved), '..', 'package.json'), 'utf8')).version,
   resolvedFrom: resolved,
   controlError: controlError?.message,
   checks,
