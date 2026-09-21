@@ -10,6 +10,12 @@
  *         @deepseek-ai/dsh-time-context
  *   node <this-repo>/scripts/probe-installed.mjs
  *
+ * Both mount spellings are exercised, because they differ: a bundle-patch loader
+ * mounts the module namespace and Cordis resolves the exported `Config`, while
+ * the `ctx.plugin({ name, inject, apply })` form passes no config at all. A
+ * package that only works under one of them is a package that fails on the
+ * machine of whoever copied the other idiom.
+ *
  * The gap it closes is the one that has bitten this family of plugins: `npm
  * test` in the repository resolves through `../lib/`, so it cannot see a runtime
  * import the manifest never declared. Only installing by name, from an empty
@@ -23,6 +29,7 @@ import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deep
 import { SessionId } from '@deepseek-ai/dsh-session'
 import * as timeContext from '@deepseek-ai/dsh-time-context'
 import * as plugin from '@argszero/cordis-plugin-inbox-input-guard'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -79,6 +86,8 @@ await control.ctx.fiber.dispose()
 
 // ---------------------------------------------------------------- guarded arm
 const guarded = await fixture()
+// The bare-object form: no `Config` for Cordis to resolve, so `apply` must cope
+// with no config argument of its own.
 await guarded.ctx.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply })
 const guardedAgent = await guarded.harness.create(SessionId('probe-guarded'))
 guardedAgent.inbox.splice('next-turn', 0, 0, [GARBAGE])
@@ -86,6 +95,16 @@ const decision = await dispatch(guarded.ctx, guardedAgent, guarded.harness.claim
 const api = guarded.ctx.get(plugin.API_NAME)
 const repaired = decision.messages[0]
 await guarded.ctx.fiber.dispose()
+
+// ------------------------------------------------------- namespace-mount arm
+const namespaced = await fixture()
+await namespaced.ctx.plugin(plugin)
+const namespacedAgent = await namespaced.harness.create(SessionId('probe-namespace'))
+namespacedAgent.inbox.splice('next-turn', 0, 0, [GARBAGE])
+const namespacedDecision = await dispatch(
+  namespaced.ctx, namespacedAgent, namespaced.harness.claim(namespacedAgent, 'next-turn', 1),
+)
+await namespaced.ctx.fiber.dispose()
 
 const checks = {
   // The defect the report describes is real in the artifact, not only in source.
@@ -99,9 +118,13 @@ const checks = {
   guardedCounts: api?.counts().repaired === 1,
   guardedDisclosesTheWrite: api?.violations()[0]?.origin === 'durable',
   serviceExposed: api !== undefined,
+  // And the way a bundle patch actually mounts it.
+  namespaceMountRepairs: namespacedDecision.kind === 'enter'
+    && namespacedDecision.messages.length === 2,
 }
 console.log(JSON.stringify({
   plugin: plugin.name,
+  version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
   resolvedFrom: resolved,
   controlError: controlError?.message,
   checks,

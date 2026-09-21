@@ -1,0 +1,12 @@
+fix: cope with a mount that passes no config object
+
+The harness's own plugin tests mount with
+`ctx.plugin({ name, inject, apply })`, which carries no `Config` for Cordis to
+resolve — so `apply` received `undefined` and threw on the first property read.
+A bundle-patch loader mounts the module namespace instead, Cordis fills the
+schema defaults, and that path was already fine; only the object form failed.
+
+`apply` now defaults its second parameter, which is also what the sibling
+@argszero plugin does. Both spellings are pinned by a new test, the installed
+probe exercises both, and the mutation that removes the default turns the suite
+red (16/16 mutations, 20/20 tests).

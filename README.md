@@ -122,8 +122,10 @@ narrower and stranger than it looks:
 npm install @argszero/cordis-plugin-inbox-input-guard
 ```
 
-declares `dsh.bundle.patch`, so a profile that picks it up mounts it with no
-config. Or add it to a bundle's `cordis.patch.yml`:
+It declares `dsh.bundle.patch`, so a profile that picks it up mounts it with no
+config. Both mount spellings work: a loader that hands over the module namespace
+gets the `Config` defaults through Cordis, and `ctx.plugin({ name, inject,
+apply })` — no `Config` for Cordis to resolve — is handled by `apply` itself. Or add it to a bundle's `cordis.patch.yml`:
 
 ```yaml
 - insert:
@@ -139,7 +141,12 @@ npm test
 
 Real Cordis, the real `AgentLoop`, a production agent with its real durable
 inbox, and the real `time-context` reader the report names. The suite includes a
-control arm that reproduces the reported crash with the plugin unmounted, and 15
+control arm that reproduces the reported crash with the plugin unmounted, and 16
 mutations of the built output, each of which turns the suite red.
+
+`scripts/probe-installed.mjs` is the other half: it imports the *published*
+package by name from a directory where it was installed from the registry, and
+runs both arms there — because `npm test` resolves through `../lib/` and cannot
+see a runtime import the manifest never declared.
 
 MIT.

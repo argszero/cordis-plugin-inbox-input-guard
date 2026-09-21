@@ -215,10 +215,16 @@ function previewOf(value: unknown, max: number): string {
 
 /**
  * Mount the guard.
+ *
+ * The default argument is deliberate: a bundle-patch loader mounts the module
+ * namespace, so Cordis resolves `Config` and this receives the schema defaults —
+ * but the `ctx.plugin({ name, inject, apply })` form, which is how the harness's
+ * own tests mount a plugin, carries no `Config` for Cordis to resolve and passes
+ * `undefined` instead. Both spellings have to work.
  * @param ctx - host context; nothing beyond core events is required.
  * @param config - mode and preview bound.
  */
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, config: Config = {} as Config): void {
   const mode: GuardMode = config.mode ?? 'repair'
   const previewChars = config.previewChars ?? 80
   const violations: InboxViolation[] = []

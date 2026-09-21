@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-inbox-input-guard",
   "description": "Inbox input guard for dsh: a claimed inbox entry that is not a UserMessage crashes the turn inside whichever module reads it first, and the report names that reader - discussion #7363 ends ~1ms after turn/start, before any step/start, with \"Cannot read properties of undefined (reading 'kind')\" thrown from time-context's browser-zone reader, because some plugin called agent.followup('a bare string') and the inbox spliced it unvalidated. This plugin sanitizes the claimed batch at the point the loop takes ownership of it (wrapping agent.inbox.claim for every agent it can hook, and repairing in place at its agent/pre-step entry for an agent that predates the mount), so no reader can be handed a non-message regardless of listener order: in repair mode a scalar is delivered verbatim as a user message whose source records the repair, and anything the guard cannot render unambiguously is dropped rather than guessed at. A session/event observer records every non-message that reaches the durable agent/inbox/spliced record - the signal the report did not have, since the defect was previously named by a crash in an unrelated module at the next turn.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

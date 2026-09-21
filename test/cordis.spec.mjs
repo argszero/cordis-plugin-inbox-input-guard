@@ -97,6 +97,33 @@ function guardApi(ctx) {
   return api
 }
 
+test('both mount spellings work: with no config at all, and with the namespace', async () => {
+  // A bundle-patch loader mounts the module namespace, so Cordis resolves the
+  // exported `Config` and `apply` receives the schema defaults. The
+  // `{ name, inject, apply }` form carries no `Config` for Cordis to resolve and
+  // passes `undefined` instead — which is how this suite's own mounts work, so
+  // both spellings are pinned here rather than assumed.
+  const bare = await mountBase()
+  await bare.ctx.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply })
+  const bareAgent = await bare.harness.create(SessionId('bare-mount'))
+  poison(bareAgent)
+  const bareDecision = await dispatch(bare.ctx, bareAgent, bare.harness.claim(bareAgent, 'next-turn', 1))
+  assert.equal(bareDecision.messages.length, 2, 'mounted with no config, the guard still repairs')
+  assert.equal(guardApi(bare.ctx).counts().repaired, 1)
+  await bare.ctx.fiber.dispose()
+
+  const namespaced = await mountBase()
+  await namespaced.ctx.plugin(plugin)
+  const namespacedAgent = await namespaced.harness.create(SessionId('namespace-mount'))
+  poison(namespacedAgent)
+  const decision = await dispatch(
+    namespaced.ctx, namespacedAgent, namespaced.harness.claim(namespacedAgent, 'next-turn', 1),
+  )
+  assert.equal(decision.messages.length, 2, 'mounted by namespace, the schema defaults are used')
+  assert.equal(guardApi(namespaced.ctx).counts().repaired, 1)
+  await namespaced.ctx.fiber.dispose()
+})
+
 test('control arm: the real reader throws the reported error on a bare string', async () => {
   const { ctx, harness } = await mountBase()
   const agent = await harness.create(SessionId('control'))
