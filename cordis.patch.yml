@@ -1,0 +1,27 @@
+# The @argszero/cordis-plugin-inbox-input-guard bundle patch.
+#
+# It needs no deployment-specific config to mount. With no config it repairs the
+# inbox entries the loop would otherwise hand to its readers unchanged: a scalar
+# that a plugin spliced in (discussion #7363's `agent.followup('a string')`) is
+# delivered verbatim as a user message whose source records the repair, and a
+# value the guard cannot render unambiguously is dropped from the batch rather
+# than guessed at.
+#
+# Tune via a profile layer if desired:
+#
+#   - set:
+#       - id: inbox-input-guard
+#         config:
+#           mode: repair        # repair | quarantine | report
+#           previewChars: 80    # bound on every recorded rendering
+#
+# `quarantine` drops every non-message instead of rendering scalars, and
+# `report` changes nothing at all -- it only records what it saw, so a broken
+# session stays exactly as broken as it was while the log names why.
+#
+# Inside a bundle whose patch already has rows, add the same `insert` entry
+# instead of a second document.
+
+- insert:
+    - id: inbox-input-guard
+      name: '@argszero/cordis-plugin-inbox-input-guard'
