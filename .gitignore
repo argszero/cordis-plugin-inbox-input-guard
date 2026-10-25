@@ -1,4 +1,4 @@
 node_modules/
-lib/
 *.tgz
 .commitmsg
+lib/index.js.orig

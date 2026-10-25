@@ -78,6 +78,26 @@ import z from '@deepseek-ai/schemastery'
 
 export const name = 'inbox-input-guard'
 
+/**
+ * This producer's own message-source kind.
+ *
+ * The harness retired the shared `plugin` catch-all: `MessageSourceMap` is
+ * merge-extensible, each producer declares its own kind in its own module, and
+ * consumers fall through kinds they do not know. The repaired message therefore
+ * says which producer wrote it instead of borrowing a name the type surface no
+ * longer carries.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'inbox-input-guard': {
+      kind: 'inbox-input-guard'
+      plugin?: string
+      form?: 'notice'
+      summary?: string
+    }
+  }
+}
+
 /** Core events and the agent's own inbox are all this plugin reaches. */
 export const inject: readonly string[] = []
 
@@ -263,7 +283,7 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
   const repairOf = (text: string, valueKind: string): UserMessage => createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
+      kind: name,
       plugin: name,
       form: 'notice',
       summary: boundContextSummary(`repaired inbox input (${valueKind})`),

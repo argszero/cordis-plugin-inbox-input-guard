@@ -12,11 +12,12 @@ import os
 import shutil
 import subprocess
 
-ROOT = '/var/folders/s6/15ymxxk93s30yr581vzzzjy40000gn/T/c498/cordis-plugin-inbox-input-guard'
+# Derived rather than hardcoded: a stale absolute root makes every anchor miss,
+# and an anchor that matches nothing reports ANCHOR-MISS instead of a verdict.
+ROOT = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(ROOT, 'lib/index.js')
 BACKUP = os.path.join(ROOT, 'lib/index.js.orig')
-NODE = '/Users/argszero/.installs/nodejs/26.5.0/bin/node'
-NODE = '/Users/argszero/.asdf/installs/nodejs/26.5.0/bin/node'
+NODE = os.environ.get('NODE_BIN') or shutil.which('node') or 'node'
 
 MUTATIONS = [
     ('the message test accepts anything: shape validation is dropped',

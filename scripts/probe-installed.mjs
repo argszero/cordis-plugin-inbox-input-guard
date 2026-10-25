@@ -119,7 +119,9 @@ const checks = {
   guardedEnters: decision.kind === 'enter',
   guardedDeliveredVerbatim: repaired?.content?.[0]?.text === GARBAGE,
   guardedAttributesTheRepair: repaired?.source?.plugin === plugin.name && repaired?.source?.form === 'notice',
-  guardedReturnsItsOwnContext: decision.messages[1]?.source?.plugin === 'time-context',
+  // On the 0.2.1 line `time-context` names itself through `kind` and carries no
+  // `plugin` field; on the earlier lines it carried both.
+  guardedReturnsItsOwnContext: decision.messages[1]?.source?.kind === 'time-context',
   guardedCounts: api?.counts().repaired === 1,
   guardedDisclosesTheWrite: api?.violations()[0]?.origin === 'durable',
   serviceExposed: api !== undefined,

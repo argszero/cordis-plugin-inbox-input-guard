@@ -7,7 +7,7 @@ Source discussion: [#7363 — `Cannot read properties of undefined (reading 'kin
 when a plugin calls `agent.followup()` with a bare string](https://github.com/deepseek-ai/deepseek-harness/discussions/7363).
 
 ```sh
-npm install @argszero/cordis-plugin-inbox-input-guard
+dsh plugin add @argszero/cordis-plugin-inbox-input-guard
 ```
 
 ## The gap
@@ -111,6 +111,42 @@ The upstream fix is a shape check at the inbox write boundary, plus a check in
 `inboxProjectionSchema`, whose `z.custom<UserMessage>()` accepts any value on
 replay. Until that lands this plugin keeps a session usable.
 
+## Compatibility
+
+Peer ranges, one group per declared line start:
+
+```
+@deepseek-ai/dsh-agent  >=0.1.5-rc.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.2.1-rc.1 <0.2.1
+@deepseek-ai/dsh-llm    >=0.1.5-rc.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.2.1-rc.1 <0.2.1
+```
+
+`test/packaging.spec.mjs` computes the admitted set with the real `semver` and
+asserts it equals exactly the builds the suite has been run against — the 0.1.5
+line (rc.1, rc.2, rc.3), the 0.1.6 line (alpha.1, alpha.2) and the 0.2.1
+release-candidate line (rc.1, rc.2, rc.3). The 0.1.7 line, the 0.2.0 line and the
+0.2.1 alphas are published and deliberately refused: they were not run.
+
+### What changed on the 0.2.1 line
+
+The reader this plugin was written against, `time-context`, used to filter
+`inbox.nextStep` and read `message.source.kind` on every entry — that read is
+what threw `Cannot read properties of undefined (reading 'kind')`. On the 0.2.1
+line its `requestMessages` walks the session's durable events instead, so a value
+sitting in the *pending* list is never read and the turn completes. The suite
+asserts that as the behaviour of the line rather than claiming a crash it no
+longer produces.
+
+The path through the *claimed batch* is unchanged: a bare string handed to
+`agent.followup()` for the next turn still reaches `requestMessages` as a
+proposed message, and the control arm still reproduces the reported error there
+with the plugin unmounted. The durable inbox also still accepts such a value
+without complaint on every declared line.
+
+The message this plugin writes now declares its own source kind
+(`inbox-input-guard`): the harness retired the shared `plugin` catch-all, so the
+repaired message names its producer instead of borrowing a literal the type
+surface no longer carries.
+
 ## Notes from the write path
 
 Worth knowing if you are writing the upstream check, because the boundary is
@@ -128,8 +164,12 @@ narrower and stranger than it looks:
 ## Install
 
 ```sh
-npm install @argszero/cordis-plugin-inbox-input-guard
+dsh plugin add @argszero/cordis-plugin-inbox-input-guard
 ```
+
+`dsh plugin add` is what attaches the plugin: it records the package in the
+profile's `dsh.profile.bundles`, which is what makes the bundle patch below take
+effect. An `npm install` alone leaves the package on disk and unmounted.
 
 It declares `dsh.bundle.patch`, so a profile that picks it up mounts it with no
 config. Both mount spellings work: a loader that hands over the module namespace
@@ -150,9 +190,10 @@ npm test
 
 Real Cordis, the real `AgentLoop`, a production agent with its real durable
 inbox, and the real `time-context` reader the report names. The suite includes a
-control arm for each placement that reproduces the reported crash with the
-plugin unmounted, and 20 mutations of the built output, each of which turns the
-suite red.
+control arm for each placement, and 20 mutations of the built output, each of
+which turns the suite red. The next-turn control arm reproduces the reported
+crash with the plugin unmounted on every declared line; the next-step one asserts
+what each line actually does (see Compatibility).
 
 `scripts/probe-installed.mjs` is the other half: it imports the *published*
 package by name from a directory where it was installed from the registry, and

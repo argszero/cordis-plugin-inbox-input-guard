@@ -6,10 +6,14 @@
  *
  * The control arm is what makes the rest evidence: with no plugin mounted the
  * suite writes one non-message into the real inbox exactly as the report does,
- * claims it through the loop's own driver, dispatches the `agent/pre-step`
- * waterfall, and the real `time-context` reader throws the reported error. The
- * same dispatch with the guard mounted completes and hands back time-context's
- * own context line.
+ * claims it through the loop's own driver, and dispatches the `agent/pre-step`
+ * waterfall. On the 0.1.5/0.1.6 lines the real `time-context` reader filtered
+ * the pending list and threw the reported error; on the 0.2.1 line it walks the
+ * session's durable events instead and never reads that value, so the arm
+ * asserts what the line does — the value survives unread — rather than a crash
+ * the line no longer produces. What the guard does is unchanged, and the same
+ * dispatch with it mounted repairs the value and hands back time-context's own
+ * context line.
  *
  * The suite pins promises that fail independently:
  *
@@ -165,29 +169,49 @@ test('the guard keeps the real reader working: the turn proceeds and returns its
   const repaired = decision.messages[0]
   assert.equal(plugin.isUsableUserMessage(repaired), true)
   assert.deepEqual(repaired.content, [{ type: 'text', text: GARBAGE }])
-  assert.equal(repaired.source.kind, 'plugin')
+  assert.equal(repaired.source.kind, 'inbox-input-guard',
+    'the repaired message carries this producer\'s own kind: the shared `plugin` kind is retired')
   assert.equal(repaired.source.plugin, plugin.name)
   assert.equal(repaired.source.form, 'notice')
   assert.match(repaired.source.summary, /repaired inbox input \(string\)/)
   // The reader that threw in the control arm ran to completion.
   const context = decision.messages[1]
-  assert.equal(context.source.kind, 'plugin')
-  assert.equal(context.source.plugin, 'time-context')
+  // The in-tree producer names itself: on the 0.2.1 line `time-context`
+  // declares `kind: name`, not the retired shared literal, and carries no
+  // redundant `plugin` field because its kind already says who wrote it.
+  assert.equal(context.source.kind, 'time-context')
+  assert.equal(context.source.form, 'snapshot')
   assert.equal(guardApi(ctx).counts().repaired, 1)
   await ctx.fiber.dispose()
 })
 
-test('control arm: a string injected into next-step mid-turn throws from the pending-list reader', async () => {
+test('control arm: the 0.2.1 reader no longer consults the pending list, and the inbox still takes the value', async () => {
   const { ctx, harness } = await mountBase()
   const agent = await harness.create(SessionId('control-pending'))
   // No claim covers this one: the value is put where the *next* step will look,
-  // while the current turn is running, and that reader indexes the projection.
+  // while the current turn is running.
   const batch = harness.claim(agent, 'next-turn', 1)
   agent.inbox.splice('next-step', 0, 0, [GARBAGE])
-  await assert.rejects(() => dispatch(ctx, agent, batch), (error) => {
-    assert.equal(error.message, CRASH)
-    return true
-  })
+
+  // Two facts, both measured on this line, and the first one is a change.
+  //
+  // The reader this plugin was written against (`time-context`) used to filter
+  // `inbox.nextStep` and read `message.source.kind` on every entry, which is
+  // what threw the reported error. On the 0.2.1 line `requestMessages` walks the
+  // session's durable events instead (`session.eventAt`), so a value sitting in
+  // the pending list is never read at all and the turn completes. That upstream
+  // change is not this plugin's doing, and the arm says so rather than claiming
+  // a crash the line does not produce.
+  const decision = await dispatch(ctx, agent, batch)
+  assert.equal(decision.kind, 'enter')
+
+  // What has NOT changed is the boundary: the inbox took the bare string without
+  // complaint, and it is still there afterwards, so every reader that does look
+  // at the pending list — another shipped plugin, a third-party one, a future
+  // line that restores the read — is handed a value with no `source` at all.
+  assert.deepEqual(agent.inbox.nextStep, [GARBAGE])
+  assert.equal(agent.inbox.nextStep[0].source, undefined)
+
   await ctx.fiber.dispose()
 })
 
@@ -447,7 +471,7 @@ test('the message contract is asserted whole, not only at the crash-relevant fie
   // message with a plugin source is a message.
   const injected = createUserMessage({
     content: [{ type: 'text', text: 'injected' }],
-    source: { kind: 'plugin', plugin: 'somewhere-else', form: 'notice', summary: 'x' },
+    source: { kind: 'somewhere-else', plugin: 'somewhere-else', form: 'notice', summary: 'x' },
   })
   assert.equal(plugin.isUsableUserMessage(injected), true)
 

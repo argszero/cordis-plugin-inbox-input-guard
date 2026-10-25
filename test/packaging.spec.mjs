@@ -11,6 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { satisfies } from 'semver'
 import { readFileSync, existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -119,4 +120,76 @@ test('the packed artifact carries the patch, the entry and the licence', () => {
   assert.ok(files.some(file => file.startsWith('lib/types/')), 'declarations must ship')
   assert.ok(!files.some(file => file.startsWith('test/')), 'tests must not ship')
   assert.ok(!files.some(file => file.startsWith('src/')), 'sources must not ship')
+})
+
+/**
+ * The peer range is a claim, so it gets a receipt.
+ *
+ * A semver comparator admits a prerelease only when some comparator in the same
+ * group shares that prerelease's `major.minor.patch` tuple, which is why each
+ * line start is named rather than covered by one caret. Asserting the admitted
+ * set *exactly* makes both directions loud: a range that quietly drops a line
+ * the suite runs on fails, and a range that admits a line nobody exercised fails
+ * the same way.
+ */
+const PUBLISHED = [
+  '0.0.1-rc.1', '0.0.1-rc.2', '0.0.1-rc.3', '0.0.1-rc.5',
+  '0.1.0-rc.2', '0.1.0-rc.3', '0.1.0-rc.6', '0.1.0-rc.7', '0.1.0-rc.8',
+  '0.1.1-rc.1', '0.1.1-rc.2',
+  '0.1.2-alpha.2', '0.1.2-alpha.3', '0.1.2-alpha.4', '0.1.2-alpha.5', '0.1.2-rc.1',
+  '0.1.3-alpha.2',
+  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
+  '0.1.6-alpha.1', '0.1.6-alpha.2',
+  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2',
+  '0.2.0-rc.1', '0.2.0-rc.2',
+  '0.2.1-alpha.1', '0.2.1-alpha.2', '0.2.1-alpha.3', '0.2.1-alpha.4', '0.2.1-alpha.5',
+  '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3',
+]
+
+/** The builds this plugin has actually been run against. */
+const SUPPORTED = [
+  '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
+  '0.1.6-alpha.1', '0.1.6-alpha.2',
+  '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3',
+]
+
+for (const dep of ['@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-llm']) {
+  test(`peer range for ${dep} admits exactly the builds the suite runs on`, () => {
+    const range = pkg.peerDependencies[dep]
+    assert.ok(range, 'the dsh peer dependency must be declared')
+    const admitted = PUBLISHED.filter((v) => satisfies(v, range))
+    assert.deepEqual(
+      admitted,
+      SUPPORTED,
+      `the range "${range}" admits [${admitted.join(', ')}] but the suite has been ` +
+        `run against [${SUPPORTED.join(', ')}]`,
+    )
+    assert.equal(
+      range.split('||').length,
+      new Set(SUPPORTED.map((v) => v.split('-')[0])).size,
+      'one group per declared line start',
+    )
+  })
+
+  test(`peer range for ${dep} refuses the lines that were never run`, () => {
+    for (const line of ['0.1.2-rc.1', '0.1.7-rc.2', '0.2.0-rc.2', '0.2.1-alpha.5', '0.3.0-rc.1']) {
+      assert.equal(satisfies(line, pkg.peerDependencies[dep]), false, `${line} must be refused`)
+    }
+    assert.equal(satisfies('0.2.1-rc.3', pkg.peerDependencies[dep]), true, 'the measured build is admitted')
+  })
+}
+
+test('the dev pins stay on a line the range admits', () => {
+  for (const [dep, pin] of Object.entries(pkg.devDependencies ?? {})) {
+    if (!dep.startsWith('@deepseek-ai/dsh-')) continue
+    assert.ok(SUPPORTED.includes(pin), `devDependency ${dep}@"${pin}" is not a build the suite runs on`)
+  }
+})
+
+test('the README quotes every peer range verbatim', () => {
+  const readme = readFileSync(join(root, 'README.md'), 'utf8')
+  for (const dep of ['@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-llm']) {
+    const range = pkg.peerDependencies[dep]
+    assert.ok(readme.includes(range), `README must quote the exact peer range: "${range}"`)
+  }
 })
