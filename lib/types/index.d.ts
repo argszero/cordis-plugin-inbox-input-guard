@@ -100,6 +100,30 @@ declare module '@deepseek-ai/dsh-llm' {
         };
     }
 }
+/** Longest `notice` summary the harness emits before truncating it. */
+export declare const CONTEXT_SUMMARY_MAX_CHARS = 120;
+/**
+ * Bound one `notice` summary to {@link CONTEXT_SUMMARY_MAX_CHARS}.
+ * @param summary - summary text to bound.
+ * @returns the summary, truncated with an ellipsis when it is too long.
+ */
+export declare function boundContextSummary(summary: string): string;
+/**
+ * Create one identified, immutable user message.
+ * @param input - content plus the producer source describing the message.
+ * @returns a frozen user message with a fresh stable identity.
+ */
+declare function createUserMessage(input: Omit<UserMessage, 'id' | 'role'>): UserMessage;
+/**
+ * @internal The carried primitives, exported so the suite can pin them against
+ * the real `@deepseek-ai/dsh-llm` in the development rig — the one place that
+ * module is resolvable.
+ */
+export declare const carriedLlmPrimitives: {
+    CONTEXT_SUMMARY_MAX_CHARS: number;
+    boundContextSummary: typeof boundContextSummary;
+    createUserMessage: typeof createUserMessage;
+};
 /** Core events and the agent's own inbox are all this plugin reaches. */
 export declare const inject: readonly string[];
 /** Service name exposing what this mount saw. */
@@ -230,3 +254,4 @@ export declare function isUsableUserMessage(value: unknown): value is UserMessag
  * @param config - mode and preview bound.
  */
 export declare function apply(ctx: Context, config?: Config): void;
+export {};

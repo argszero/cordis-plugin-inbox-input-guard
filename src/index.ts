@@ -78,10 +78,10 @@
  * @module @argszero/cordis-plugin-inbox-input-guard
  */
 
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 
@@ -105,6 +105,99 @@ declare module '@deepseek-ai/dsh-llm' {
       summary?: string
     }
   }
+}
+
+/*
+ * The two `@deepseek-ai/dsh-llm` primitives this entry calls, carried locally.
+ *
+ * A profile resolves a plugin's own `dependencies` and nothing else: the harness
+ * packages a third-party plugin peers on live in the `dsh` CLI's tree, which a
+ * module loaded out of a profile cannot resolve. A value import of
+ * `@deepseek-ai/dsh-llm` therefore makes the installed copy fail to load —
+ * `ERR_MODULE_NOT_FOUND` at import time, before a single line of the plugin runs
+ * — even though `dsh plugin add` exits 0 and the entry appears in the composed
+ * config. The two primitives are reproduced below, and `test/cordis.spec.mjs`
+ * pins each against the real module, so drift in the harness turns into a red
+ * test here instead of a silent behaviour difference in a profile.
+ *
+ * Sources at dsh 0.2.1-rc.5: `packages/llm/llm/src/message.ts` —
+ * `CONTEXT_SUMMARY_MAX_CHARS` (:122), `boundContextSummary` (:129),
+ * `createMessage` (:221), `createUserMessage` (:246) — and `deepFreeze` from
+ * `packages/util/values/src/index.ts` (:195). The brands `createMessage` applies
+ * (`brandString<MessageId>`) are compile-time only, so the identity below is the
+ * same string the harness itself would have minted.
+ */
+
+/** Longest `notice` summary the harness emits before truncating it. */
+export const CONTEXT_SUMMARY_MAX_CHARS = 120
+
+/**
+ * Bound one `notice` summary to {@link CONTEXT_SUMMARY_MAX_CHARS}.
+ * @param summary - summary text to bound.
+ * @returns the summary, truncated with an ellipsis when it is too long.
+ */
+export function boundContextSummary(summary: string): string {
+  return summary.length <= CONTEXT_SUMMARY_MAX_CHARS
+    ? summary
+    : `${summary.slice(0, CONTEXT_SUMMARY_MAX_CHARS - 1)}…`
+}
+
+/**
+ * Deep-freeze an object graph in place while leaving live AbortSignal objects mutable.
+ * @param value - value to freeze.
+ * @returns the same value after every reachable enumerable child is frozen.
+ */
+function deepFreeze<T>(value: T): T {
+  const seen = new WeakSet<object>()
+  const pending: (
+    | { kind: 'visit'; node: unknown }
+    | { kind: 'property'; source: Record<string, unknown>; key: string }
+  )[] = [{ kind: 'visit', node: value }]
+  while (pending.length > 0) {
+    const task = pending.pop()
+    if (task === undefined) continue
+    if (task.kind === 'property') {
+      pending.push({ kind: 'visit', node: task.source[task.key] })
+      continue
+    }
+    const node = task.node
+    if (node === null || typeof node !== 'object') continue
+    if (node instanceof AbortSignal) continue
+    if (seen.has(node)) continue
+    seen.add(node)
+    Object.freeze(node)
+    const keys = Object.keys(node)
+    for (let index = keys.length - 1; index >= 0; index--) {
+      const key = keys[index]
+      if (key === undefined) continue
+      pending.push({ kind: 'property', source: node as Record<string, unknown>, key })
+    }
+  }
+  return value
+}
+
+/**
+ * Create one identified, immutable user message.
+ * @param input - content plus the producer source describing the message.
+ * @returns a frozen user message with a fresh stable identity.
+ */
+function createUserMessage(input: Omit<UserMessage, 'id' | 'role'>): UserMessage {
+  return deepFreeze(structuredClone({
+    ...input,
+    id: randomUUID() as UserMessage['id'],
+    role: 'user' as const,
+  }))
+}
+
+/**
+ * @internal The carried primitives, exported so the suite can pin them against
+ * the real `@deepseek-ai/dsh-llm` in the development rig — the one place that
+ * module is resolvable.
+ */
+export const carriedLlmPrimitives = {
+  CONTEXT_SUMMARY_MAX_CHARS,
+  boundContextSummary,
+  createUserMessage,
 }
 
 /** Core events and the agent's own inbox are all this plugin reaches. */

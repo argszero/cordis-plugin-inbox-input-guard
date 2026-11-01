@@ -46,10 +46,16 @@ test('every runtime import is a declared dependency or peer', () => {
     ...Object.keys(pkg.peerDependencies ?? {}),
   ])
   const imported = bareImports(built)
-  // `@deepseek-ai/schemastery` is the only real runtime dependency; `dsh-llm`
-  // supplies `createUserMessage`/`boundContextSummary` and stays a peer, so a
-  // consumer's own copy is the one that runs.
-  assert.deepEqual(imported, ['@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery'])
+  // `@deepseek-ai/schemastery` is the only real runtime dependency. A harness
+  // package is never imported at runtime, not even as a peer: a profile resolves
+  // the plugin's own `dependencies`, and the harness tree lives under the `dsh`
+  // CLI where a module loaded from a profile cannot reach it. Importing
+  // `dsh-llm` for its primitives made the installed copy throw
+  // ERR_MODULE_NOT_FOUND before a line of it ran, while `dsh plugin add` still
+  // exited 0 and the entry still appeared in the composed config. Those
+  // primitives are carried in `src/index.ts` and pinned against the real module
+  // by `cordis.spec.mjs`; the peer declaration stays, for its types.
+  assert.deepEqual(imported, ['@deepseek-ai/schemastery'])
   for (const specifier of imported) {
     assert.ok(declared.has(specifier), `${specifier} is imported but not declared`)
   }

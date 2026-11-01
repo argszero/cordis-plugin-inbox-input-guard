@@ -7,8 +7,10 @@ Source discussion: [#7363 — `Cannot read properties of undefined (reading 'kin
 when a plugin calls `agent.followup()` with a bare string](https://github.com/deepseek-ai/deepseek-harness/discussions/7363).
 
 ```sh
-dsh plugin add @argszero/cordis-plugin-inbox-input-guard
+dsh plugin add "github:argszero/cordis-plugin-inbox-input-guard#v0.3.1"
 ```
+
+The npm package stops at 0.2.0; releases after that are git tags — see [Install](#install).
 
 ## The gap
 
@@ -156,6 +158,14 @@ than echoed.
 - Records are bounded (`assemblyLimit`, default 256, oldest dropped first) while
   the totals keep counting every step, so a long session cannot grow this
   without limit.
+- **It imports nothing from the harness at runtime.** A profile resolves this
+  package's own `dependencies`, and the harness tree lives under the `dsh` CLI,
+  out of reach of a module loaded from a profile. The two primitives it needs
+  from `@deepseek-ai/dsh-llm` — `createUserMessage` and `boundContextSummary` —
+  are therefore carried in the entry and pinned against the real module by the
+  suite. Importing them would make the installed copy throw
+  `ERR_MODULE_NOT_FOUND` at load time while `dsh plugin add` still exited 0;
+  that is what 0.3.0 did, and 0.3.1 is the fix.
 
 The upstream fix is a shape check at the inbox write boundary, plus a check in
 `inboxProjectionSchema`, whose `z.custom<UserMessage>()` accepts any value on
@@ -214,6 +224,11 @@ narrower and stranger than it looks:
 ## Install
 
 ```sh
+# the tagged build (0.3.1) — the line the suite and the notes above describe
+dsh plugin add "github:argszero/cordis-plugin-inbox-input-guard#v0.3.1"
+
+# from npm — read on 2026-11-01, `npm view` reports 0.2.0, which has neither
+# `carriedLlmPrimitives` nor the per-step assembly audit
 dsh plugin add @argszero/cordis-plugin-inbox-input-guard
 ```
 

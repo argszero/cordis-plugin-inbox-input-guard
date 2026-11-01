@@ -34,10 +34,11 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_SUMMARY_MAX_CHARS, boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import * as agentInstructions from '@deepseek-ai/dsh-agent-instructions'
 import * as timeContext from '@deepseek-ai/dsh-time-context'
@@ -836,4 +837,86 @@ test('the record bound drops the oldest while the totals keep counting', async (
   assert.deepEqual(records.map((record) => record.turn), [3, 4], 'oldest dropped first')
   assert.equal(guardApi(ctx).assemblyCounts().steps, 4, 'the totals outlive the records')
   await ctx.fiber.dispose()
+})
+
+/*
+ * The install face — the one thing a unit test of the source cannot see.
+ *
+ * `dsh plugin add` exits 0 and the entry appears in the composed config even when
+ * the installed module cannot be imported at all: a profile resolves the plugin's
+ * own `dependencies`, and the harness packages it peers on live in the `dsh` CLI's
+ * tree, out of reach of a module loaded from a profile. These arms therefore read
+ * the BUILD rather than the source — a value import of `@deepseek-ai/dsh-llm` is
+ * the difference between a plugin that runs and one that throws
+ * `ERR_MODULE_NOT_FOUND` before its first line — and pin each carried primitive
+ * to the real module, which is resolvable here and nowhere else.
+ */
+
+/** A value import of the harness-only peer, which a profile cannot resolve. */
+const LLM_PEER_VALUE_IMPORT = /(?:^|\n)\s*import\s[^;\n]*?from\s*['"]@deepseek-ai\/dsh-llm['"]/
+
+/** A freshly minted identity, the shape the harness's own `randomUUID()` gives. */
+const FRESH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+test('the built entry imports no harness peer a profile cannot resolve', async () => {
+  const source = await readFile(new URL('../lib/index.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(
+    source,
+    LLM_PEER_VALUE_IMPORT,
+    'a value import of dsh-llm throws ERR_MODULE_NOT_FOUND when the installed copy is loaded from a profile',
+  )
+  assert.match(source, /['"]node:crypto['"]/, 'the identity the carried constructor mints comes from node, not the harness')
+})
+
+test('the carried primitives are reachable from the build', () => {
+  const carried = plugin.carriedLlmPrimitives
+  assert.equal(typeof carried?.createUserMessage, 'function', 'the entry exports its carried message constructor')
+  assert.equal(typeof carried?.boundContextSummary, 'function', 'the entry exports its carried summary bound')
+  assert.equal(carried?.CONTEXT_SUMMARY_MAX_CHARS, CONTEXT_SUMMARY_MAX_CHARS, 'the constant is the harness\'s own')
+})
+
+test('the carried summary bound agrees with the harness at every boundary', async () => {
+  const { boundContextSummary: carried } = plugin.carriedLlmPrimitives
+  for (const length of [0, 1, 118, 119, 120, 121, 200, 500]) {
+    const summary = 'x'.repeat(length)
+    assert.equal(carried(summary), boundContextSummary(summary), `summary of length ${String(length)}`)
+  }
+  const atBound = 'y'.repeat(CONTEXT_SUMMARY_MAX_CHARS)
+  assert.equal(carried(atBound), atBound, 'a summary exactly at the bound is left alone')
+  assert.equal(carried(`${atBound}z`).length, CONTEXT_SUMMARY_MAX_CHARS, 'one character over is still bounded')
+})
+
+test('the carried message constructor produces what the harness produces', () => {
+  const input = {
+    content: [{ type: 'text', text: 'repaired inbox input (string)' }],
+    source: {
+      kind: 'inbox-input-guard',
+      plugin: 'inbox-input-guard',
+      form: 'notice',
+      summary: 'repaired inbox input (string)',
+    },
+  }
+  const carried = plugin.carriedLlmPrimitives.createUserMessage(input)
+  const upstream = createUserMessage(input)
+  assert.equal(carried.role, upstream.role, 'the role is the same')
+  assert.deepEqual(Object.keys(carried).sort(), Object.keys(upstream).sort(), 'no key the harness does not write')
+  assert.match(carried.id, FRESH_ID, 'the identity is a fresh uuid the harness would accept')
+  const id = carried.id
+  assert.equal(plugin.carriedLlmPrimitives.createUserMessage(input).id === id, false, 'every call mints its own identity')
+  const { id: carriedId, ...carriedRest } = structuredClone(carried)
+  const { id: upstreamId, ...upstreamRest } = structuredClone(upstream)
+  assert.notEqual(carriedId, upstreamId, 'two constructors never collide')
+  assert.deepEqual(carriedRest, upstreamRest, 'everything but the identity is identical')
+})
+
+test('the carried message is frozen the way the harness freezes messages', () => {
+  const carried = plugin.carriedLlmPrimitives.createUserMessage({
+    content: [{ type: 'text', text: 'a' }],
+    source: { kind: 'inbox-input-guard', plugin: 'inbox-input-guard', form: 'notice', summary: 'frozen' },
+  })
+  assert.ok(Object.isFrozen(carried), 'the message')
+  assert.ok(Object.isFrozen(carried.content), 'the content array')
+  assert.ok(Object.isFrozen(carried.content[0]), 'the content block')
+  assert.ok(Object.isFrozen(carried.source), 'the source')
+  assert.throws(() => { carried.content[0].text = 'b' }, TypeError, 'a frozen block refuses the write')
 })
