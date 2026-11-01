@@ -40,6 +40,15 @@
  *    above did not have: the defect is named at the moment it is committed,
  *    instead of surfacing as a crash in an unrelated module. It observes only —
  *    a plugin cannot rewrite committed history.
+ * 4. **Around the waterfall.** The same `agent/pre-step` listener also audits
+ *    the *assembly*: it snapshots the claimed batch, calls `next()`, and
+ *    compares what the decision carries against what was claimed. Messages the
+ *    decision added that were not in the claim were manufactured during this
+ *    step, and a message that presents itself as user-authored
+ *    (`source.kind: 'user'`) while not coming from the claim is text standing in
+ *    for a human who never typed it. The record is metadata only — positions,
+ *    counts, and a bounded producer slug — so it can be shipped in a report
+ *    about a session whose text is private. See *Reading the assembly*.
  *
  * ## What it does with the value
  *
@@ -110,6 +119,11 @@ export interface Config {
     readonly mode?: GuardMode;
     /** Characters of the offending value kept in a record and in the log line. */
     readonly previewChars?: number;
+    /**
+     * Assembly records kept per mount, oldest dropped first. The audit is on for
+     * every step; this only bounds what is retained for `assembly()`.
+     */
+    readonly assemblyLimit?: number;
 }
 export declare const Config: z<Config>;
 /** One inbox entry the guard would not hand to the loop unchanged. */
@@ -131,12 +145,65 @@ export interface InboxViolation {
     readonly preview: string;
     readonly action: ViolationAction;
 }
+/**
+ * One step's assembly, recorded without any of its content.
+ *
+ * Every field is a count, a position, or a producer slug. No message text, no
+ * tool argument, no path and no `notice` summary is read or retained: those are
+ * caller text, and a diagnostic that quotes them cannot be attached to a report
+ * about a session whose content is private.
+ */
+export interface AssemblyRecord {
+    /** Epoch milliseconds at which the step settled. */
+    readonly at: number;
+    /** Session whose step this was. */
+    readonly sessionId: string;
+    readonly turn: number;
+    readonly step: number;
+    /** Messages the loop claimed and handed to the waterfall. */
+    readonly claimed: number;
+    /** Messages the decision carries (`0` when the step was rejected). */
+    readonly admitted: number;
+    /** Admitted messages that were not in the claim, by identity. */
+    readonly added: number;
+    /** Positions of those messages inside the admitted batch. */
+    readonly addedAt: readonly number[];
+    /** Bounded producer slug of each added message, in order. */
+    readonly addedKinds: readonly string[];
+    /** Added messages that present themselves as user-authored. */
+    readonly addedAsUser: number;
+    /** Added messages carrying no content block at all. */
+    readonly addedEmpty: number;
+    /** Claimed messages the decision no longer carries. */
+    readonly dropped: number;
+    readonly outcome: 'enter' | 'reject';
+    /**
+     * Whether a reader should look at this step: something was admitted as a user
+     * message without coming from the inbox. That is the only anomaly this audit
+     * asserts — an added message of any other kind is a producer declaring itself,
+     * which is how the mechanism is meant to work.
+     */
+    readonly anomalous: boolean;
+}
+/** Step totals for this mount, independent of how many records were retained. */
+export interface AssemblyCounts {
+    /** Steps audited, including those whose record was dropped by the bound. */
+    readonly steps: number;
+    /** Steps that admitted a user-authored message the inbox never delivered. */
+    readonly anomalous: number;
+    /** Steps whose audit itself failed; the turn was never affected. */
+    readonly errors: number;
+}
 /** The guard's read surface, reachable as `ctx.get('inboxInputGuard')`. */
 export interface InboxInputGuardApi {
     /** Every violation this mount saw, oldest first. */
     violations(): readonly InboxViolation[];
     /** Per-action totals for this mount. */
     counts(): Readonly<Record<ViolationAction, number>>;
+    /** Retained assembly records, oldest first, bounded by `assemblyLimit`. */
+    assembly(): readonly AssemblyRecord[];
+    /** Step totals, which outlive the record bound. */
+    assemblyCounts(): AssemblyCounts;
     /** Drop the records; hooks stay installed. */
     reset(): void;
 }

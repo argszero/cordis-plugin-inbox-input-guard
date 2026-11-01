@@ -19,6 +19,11 @@
 # `report` changes nothing at all -- it only records what it saw, so a broken
 # session stays exactly as broken as it was while the log names why.
 #
+# The same mount also audits each step's assembly and records it without any
+# content (`guard.assembly()`): messages the decision carries that the claim did
+# not are additions, and one presenting as user-authored is text standing in for
+# a human who never typed it. It observes; it removes nothing.
+#
 # Inside a bundle whose patch already has rows, add the same `insert` entry
 # instead of a second document.
 

@@ -40,6 +40,15 @@
  *    above did not have: the defect is named at the moment it is committed,
  *    instead of surfacing as a crash in an unrelated module. It observes only —
  *    a plugin cannot rewrite committed history.
+ * 4. **Around the waterfall.** The same `agent/pre-step` listener also audits
+ *    the *assembly*: it snapshots the claimed batch, calls `next()`, and
+ *    compares what the decision carries against what was claimed. Messages the
+ *    decision added that were not in the claim were manufactured during this
+ *    step, and a message that presents itself as user-authored
+ *    (`source.kind: 'user'`) while not coming from the claim is text standing in
+ *    for a human who never typed it. The record is metadata only — positions,
+ *    counts, and a bounded producer slug — so it can be shipped in a report
+ *    about a session whose text is private. See *Reading the assembly*.
  *
  * ## What it does with the value
  *
@@ -122,11 +131,17 @@ export interface Config {
   readonly mode?: GuardMode
   /** Characters of the offending value kept in a record and in the log line. */
   readonly previewChars?: number
+  /**
+   * Assembly records kept per mount, oldest dropped first. The audit is on for
+   * every step; this only bounds what is retained for `assembly()`.
+   */
+  readonly assemblyLimit?: number
 }
 
 export const Config: z<Config> = z.object({
   mode: z.union([z.const('repair'), z.const('quarantine'), z.const('report')]).default('repair'),
   previewChars: z.number().default(80),
+  assemblyLimit: z.number().default(256),
 })
 
 /** One inbox entry the guard would not hand to the loop unchanged. */
@@ -149,12 +164,67 @@ export interface InboxViolation {
   readonly action: ViolationAction
 }
 
+/**
+ * One step's assembly, recorded without any of its content.
+ *
+ * Every field is a count, a position, or a producer slug. No message text, no
+ * tool argument, no path and no `notice` summary is read or retained: those are
+ * caller text, and a diagnostic that quotes them cannot be attached to a report
+ * about a session whose content is private.
+ */
+export interface AssemblyRecord {
+  /** Epoch milliseconds at which the step settled. */
+  readonly at: number
+  /** Session whose step this was. */
+  readonly sessionId: string
+  readonly turn: number
+  readonly step: number
+  /** Messages the loop claimed and handed to the waterfall. */
+  readonly claimed: number
+  /** Messages the decision carries (`0` when the step was rejected). */
+  readonly admitted: number
+  /** Admitted messages that were not in the claim, by identity. */
+  readonly added: number
+  /** Positions of those messages inside the admitted batch. */
+  readonly addedAt: readonly number[]
+  /** Bounded producer slug of each added message, in order. */
+  readonly addedKinds: readonly string[]
+  /** Added messages that present themselves as user-authored. */
+  readonly addedAsUser: number
+  /** Added messages carrying no content block at all. */
+  readonly addedEmpty: number
+  /** Claimed messages the decision no longer carries. */
+  readonly dropped: number
+  readonly outcome: 'enter' | 'reject'
+  /**
+   * Whether a reader should look at this step: something was admitted as a user
+   * message without coming from the inbox. That is the only anomaly this audit
+   * asserts — an added message of any other kind is a producer declaring itself,
+   * which is how the mechanism is meant to work.
+   */
+  readonly anomalous: boolean
+}
+
+/** Step totals for this mount, independent of how many records were retained. */
+export interface AssemblyCounts {
+  /** Steps audited, including those whose record was dropped by the bound. */
+  readonly steps: number
+  /** Steps that admitted a user-authored message the inbox never delivered. */
+  readonly anomalous: number
+  /** Steps whose audit itself failed; the turn was never affected. */
+  readonly errors: number
+}
+
 /** The guard's read surface, reachable as `ctx.get('inboxInputGuard')`. */
 export interface InboxInputGuardApi {
   /** Every violation this mount saw, oldest first. */
   violations(): readonly InboxViolation[]
   /** Per-action totals for this mount. */
   counts(): Readonly<Record<ViolationAction, number>>
+  /** Retained assembly records, oldest first, bounded by `assemblyLimit`. */
+  assembly(): readonly AssemblyRecord[]
+  /** Step totals, which outlive the record bound. */
+  assemblyCounts(): AssemblyCounts
   /** Drop the records; hooks stay installed. */
   reset(): void
 }
@@ -204,6 +274,9 @@ function valueKindOf(value: unknown): string {
   }
   return type
 }
+
+/** A producer-declared source kind is a slug: lowercase, short, no spaces or paths. */
+const SOURCE_KIND_PATTERN = /^[a-z0-9][a-z0-9._-]{0,31}$/
 
 /**
  * The text a scalar contributes verbatim.
@@ -256,6 +329,9 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
   const previewChars = config.previewChars ?? 80
   const violations: InboxViolation[] = []
   const counts: Record<ViolationAction, number> = { repaired: 0, quarantined: 0, observed: 0 }
+  const assemblyRecords: AssemblyRecord[] = []
+  const assemblyLimit = Math.max(1, Math.trunc(config.assemblyLimit ?? 256))
+  const assemblyTotals = { steps: 0, anomalous: 0, errors: 0 }
   const wrapped = new Map<Agent, { inbox: InboxLike; hadOwn: boolean; original: Claim }>()
 
   const record = (violation: InboxViolation): void => {
@@ -381,6 +457,110 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
     }
   }
 
+  /**
+   * A producer's own name for itself, bounded to a slug.
+   *
+   * `MessageSourceMap` is merge-extensible, so a kind is whatever its producer
+   * declares — caller-controlled in principle. A record meant to be safe to ship
+   * therefore reports a kind it can recognise as a slug and `unrecognized`
+   * otherwise, rather than echoing a value that could be anything.
+   */
+  const sourceKindOf = (message: UserMessage): string => {
+    const kind = (message as { source?: { kind?: unknown } }).source?.kind
+    if (typeof kind !== 'string' || kind.length === 0) return 'unknown'
+    return SOURCE_KIND_PATTERN.test(kind) ? kind : 'unrecognized'
+  }
+
+  /**
+   * Record what one step did to the batch, without reading any of it.
+   *
+   * The comparison is identity, not content: a message in the decision that the
+   * claim did not carry was produced during this step, and its `source.kind`
+   * says what it claims to be. The built-in runtime-context append declares its
+   * own kind (`runtime-context`), so it is visible here as an addition that is
+   * *not* impersonating anyone — which is what makes `source.kind: 'user'` on an
+   * added message the discriminator worth reporting.
+   *
+   * Only `source.kind` and `content.length` are read. Text, tool arguments,
+   * paths and `notice` summaries are caller text and are never touched.
+   */
+  const auditStep = (
+    agent: Agent,
+    claimed: readonly UserMessage[],
+    turn: number,
+    step: number,
+    decision: unknown,
+  ): void => {
+    const settlement = decision as { kind?: unknown; messages?: unknown }
+    const admitted = settlement.kind === 'enter' && Array.isArray(settlement.messages)
+      ? settlement.messages as readonly UserMessage[]
+      : []
+    // Occurrences, not membership: the report describes one message duplicated
+    // up to twelve times, and a duplicate is the *same object* handed out again.
+    // A set would collapse it and report nothing; a multiset consumes the claim
+    // one occurrence at a time, so the second copy is what it is — an addition.
+    const remaining = new Map<unknown, number>()
+    for (const message of claimed) remaining.set(message, (remaining.get(message) ?? 0) + 1)
+    const addedAt: number[] = []
+    const addedKinds: string[] = []
+    const asUserAt: number[] = []
+    let addedAsUser = 0
+    let addedEmpty = 0
+    for (let index = 0; index < admitted.length; index += 1) {
+      const message = admitted[index]
+      if (message === undefined) continue
+      const left = remaining.get(message) ?? 0
+      if (left > 0) {
+        remaining.set(message, left - 1)
+        continue
+      }
+      addedAt.push(index)
+      const kind = sourceKindOf(message)
+      addedKinds.push(kind)
+      if (kind === 'user') {
+        addedAsUser += 1
+        asUserAt.push(index)
+      }
+      const content = (message as { content?: unknown }).content
+      if (Array.isArray(content) && content.length === 0) addedEmpty += 1
+    }
+    let dropped = 0
+    for (const left of remaining.values()) dropped += left
+    const record: AssemblyRecord = {
+      at: Date.now(),
+      sessionId: String(agent.session.id),
+      turn,
+      step,
+      claimed: claimed.length,
+      admitted: admitted.length,
+      added: addedAt.length,
+      addedAt,
+      addedKinds,
+      addedAsUser,
+      addedEmpty,
+      dropped,
+      outcome: settlement.kind === 'reject' ? 'reject' : 'enter',
+      anomalous: addedAsUser > 0,
+    }
+    assemblyRecords.push(record)
+    if (assemblyRecords.length > assemblyLimit) {
+      assemblyRecords.splice(0, assemblyRecords.length - assemblyLimit)
+    }
+    assemblyTotals.steps += 1
+    if (!record.anomalous) return
+    assemblyTotals.anomalous += 1
+    // Loud only when something is wrong: a healthy step records silently, so the
+    // log stays a signal instead of a per-step trace.
+    ctx.logger.warn(
+      'inbox input guard: session "%s" turn %s step %s admitted %s message(s) the inbox did not deliver, presenting as user-authored (positions %s)',
+      record.sessionId,
+      String(turn),
+      String(step),
+      String(addedAsUser),
+      asUserAt.join(','),
+    )
+  }
+
   const restore = (agent: Agent): void => {
     const entry = wrapped.get(agent)
     if (entry === undefined) return
@@ -417,7 +597,7 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
 
   ctx.on('agent/created', ({ agent }): undefined => { hook(agent); return undefined })
 
-  ctx.on('agent/pre-step', (payload, next) => {
+  ctx.on('agent/pre-step', async (payload, next) => {
     // An agent that predates this mount has no wrapped claim yet: its current
     // batch is repaired here, and hooking it covers every later turn. The
     // pending sweep runs first, because the modules that index the pending lists
@@ -426,7 +606,20 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
     sanitizePending(payload.agent)
     sanitize(payload.messages, 'claimed', String(payload.agent.session.id), null, null)
     hook(payload.agent)
-    return next()
+    // Snapshot the claim before `next()`: the fallback continuation returns a
+    // new array (`[...claimed, context]`), so the claim's own members are what an
+    // addition is measured against. This and the audit below are the whole of
+    // the assembly half — the batch itself is never changed by it.
+    const claimed = payload.messages.slice()
+    const decision = await next()
+    try {
+      auditStep(payload.agent, claimed, payload.turn, payload.step, decision)
+    } catch (error: unknown) {
+      // Fail open. An audit that can break a turn is worse than no audit: the
+      // failure is counted, and the loop's own decision is handed back untouched.
+      assemblyTotals.errors += 1
+    }
+    return decision
   }, { prepend: true })
 
   ctx.on('session/event', (session, event) => {
@@ -454,11 +647,17 @@ export function apply(ctx: Context, config: Config = {} as Config): void {
   ctx.provide(API_NAME, {
     violations: (): readonly InboxViolation[] => violations.slice(),
     counts: (): Readonly<Record<ViolationAction, number>> => ({ ...counts }),
+    assembly: (): readonly AssemblyRecord[] => assemblyRecords.slice(),
+    assemblyCounts: (): AssemblyCounts => ({ ...assemblyTotals }),
     reset: (): void => {
       violations.length = 0
       counts.repaired = 0
       counts.quarantined = 0
       counts.observed = 0
+      assemblyRecords.length = 0
+      assemblyTotals.steps = 0
+      assemblyTotals.anomalous = 0
+      assemblyTotals.errors = 0
     },
   } satisfies InboxInputGuardApi)
 

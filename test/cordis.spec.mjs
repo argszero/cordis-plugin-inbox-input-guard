@@ -580,3 +580,260 @@ test('a second bare string in one splice is rejected by the id guard, not by thi
   assert.throws(() => agent.inbox.splice('next-turn', 0, 0, [undefined]), TypeError)
   await ctx.fiber.dispose()
 })
+
+/* ── the assembly half ────────────────────────────────────────────────────────
+ * A second question at the same seam, from discussion #11575: phantom user
+ * messages reached a model request that the user never typed and that the log
+ * never held. The guard already observes this seam; these arms pin the audit it
+ * now keeps of it.
+ *
+ * The rig is the real one, which decides the shape of every expectation here:
+ * the guard's listener is outermost, the shipped `time-context` reader wraps
+ * inside it and appends its own snapshot, and a test listener registered last
+ * runs innermost. So one quiet step legitimately adds the `time-context`
+ * message, and the arms assert that addition explicitly — the built-in
+ * continuation is the case the audit must *not* call an anomaly.
+ */
+
+/** A message that declares itself the work of some producer. */
+function messageFrom(kind, text = 'from a producer') {
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind } })
+}
+
+/** A message the loop's own readers accept: a user message with a source. */
+function legalPrompt(text) {
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+/** The message the shipped reader appends to every step; the built-in continuation's shape. */
+const BUILT_IN = 'time-context'
+
+/** Register a listener after the guard, so it runs inside the guard's `next()`. */
+function appendAfterGuard(ctx, build) {
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    if (decision.kind !== 'enter') return decision
+    return { ...decision, messages: build(decision.messages) }
+  })
+}
+
+/** One quiet dispatch: a legal prompt claimed, one step run. */
+async function oneStep(ctx, harness, id, turn = 1) {
+  const agent = await harness.create(SessionId(id))
+  agent.inbox.splice('next-turn', 0, 0, [legalPrompt('a legal message')])
+  const decision = await dispatch(ctx, agent, harness.claim(agent, 'next-turn', turn), { turn })
+  return { agent, decision }
+}
+
+test('a quiet step records the built-in continuation as an addition and calls nothing anomalous', async () => {
+  const { ctx, harness, warnings } = await mountBase()
+  await mountGuard(ctx)
+  await oneStep(ctx, harness, 'assembly-clean')
+
+  const [record, ...rest] = guardApi(ctx).assembly()
+  assert.equal(rest.length, 0)
+  assert.equal(record.claimed, 1, 'the claim is what the inbox handed the loop')
+  assert.equal(record.admitted, 2, 'the claim plus the reader’s own context')
+  assert.equal(record.added, 1)
+  assert.deepEqual(record.addedAt, [1])
+  assert.deepEqual(record.addedKinds, [BUILT_IN], 'the built-in append declares its own kind')
+  assert.equal(record.addedAsUser, 0)
+  assert.equal(record.addedEmpty, 0)
+  assert.equal(record.dropped, 0)
+  assert.equal(record.outcome, 'enter')
+  assert.equal(record.anomalous, false)
+  assert.equal(record.sessionId, 'assembly-clean')
+  assert.equal(record.turn, 1)
+  assert.equal(record.step, 1)
+  assert.deepEqual(warnings, [], 'a healthy step writes no log line')
+  assert.deepEqual(guardApi(ctx).assemblyCounts(), { steps: 1, anomalous: 0, errors: 0 })
+  await ctx.fiber.dispose()
+})
+
+test('a message admitted as user-authored that the inbox never delivered is recorded — and left in place', async () => {
+  const { ctx, harness, warnings } = await mountBase()
+  await mountGuard(ctx)
+  const phantom = messageFrom('user', 'text the human never typed')
+  appendAfterGuard(ctx, (messages) => [...messages, phantom])
+  const { decision } = await oneStep(ctx, harness, 'assembly-phantom')
+
+  const [record] = guardApi(ctx).assembly()
+  assert.equal(record.claimed, 1)
+  assert.equal(record.admitted, 3)
+  assert.equal(record.added, 2)
+  assert.deepEqual(record.addedAt, [1, 2], 'position 1 is where the request gains text')
+  assert.deepEqual(record.addedKinds, ['user', BUILT_IN])
+  assert.equal(record.addedAsUser, 1)
+  assert.equal(record.anomalous, true)
+  // Observing is the whole contract: the guard does not remove it, and the loop
+  // receives the message the listener added.
+  assert.equal(decision.messages.includes(phantom), true)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /session "assembly-phantom" turn 1 step 1 admitted 1 message\(s\) the inbox did not deliver/)
+  assert.match(warnings[0], /positions 1\)$/)
+  await ctx.fiber.dispose()
+})
+
+test('a producer that declares its own kind is reported, not flagged', async () => {
+  const { ctx, harness, warnings } = await mountBase()
+  await mountGuard(ctx)
+  appendAfterGuard(ctx, (messages) => [...messages, messageFrom('runtime-context')])
+  await oneStep(ctx, harness, 'assembly-context')
+
+  const [record] = guardApi(ctx).assembly()
+  assert.equal(record.added, 2)
+  assert.deepEqual(record.addedKinds, ['runtime-context', BUILT_IN])
+  assert.equal(record.addedAsUser, 0)
+  assert.equal(record.anomalous, false)
+  assert.deepEqual(warnings, [], 'a declared producer is the mechanism working, not a finding')
+  await ctx.fiber.dispose()
+})
+
+test('a duplicate of a claimed message is an addition too — the shape the report describes', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  // The same object handed back a second time: a set would collapse it, which is
+  // why the audit counts occurrences.
+  appendAfterGuard(ctx, (messages) => [messages[0], ...messages])
+  await oneStep(ctx, harness, 'assembly-dup')
+
+  const [record] = guardApi(ctx).assembly()
+  assert.equal(record.claimed, 1)
+  assert.equal(record.added, 2)
+  assert.deepEqual(record.addedAt, [1, 2])
+  assert.deepEqual(record.addedKinds, ['user', BUILT_IN])
+  assert.equal(record.addedAsUser, 1, 'the copy still presents itself as the human')
+  assert.equal(record.dropped, 0, 'nothing was lost — the original is still there')
+  assert.equal(record.anomalous, true)
+  await ctx.fiber.dispose()
+})
+
+test('an empty added message is counted as empty, without reading anything', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  const empty = createUserMessage({ content: [], source: { kind: 'user' } })
+  appendAfterGuard(ctx, (messages) => [...messages, empty])
+  await oneStep(ctx, harness, 'assembly-empty')
+
+  const [record] = guardApi(ctx).assembly()
+  assert.equal(record.addedEmpty, 1)
+  assert.equal(record.addedAsUser, 1)
+  await ctx.fiber.dispose()
+})
+
+test('a rejected step admits nothing and is recorded as such', async () => {
+  const { ctx, harness, warnings } = await mountBase()
+  await mountGuard(ctx)
+  ctx.on('agent/pre-step', async (_payload, next) => { await next(); return { kind: 'reject' } })
+  const { decision } = await oneStep(ctx, harness, 'assembly-reject')
+
+  assert.equal(decision.kind, 'reject')
+  const [record] = guardApi(ctx).assembly()
+  assert.equal(record.outcome, 'reject')
+  assert.equal(record.admitted, 0)
+  assert.equal(record.added, 0)
+  assert.equal(record.dropped, 1)
+  assert.equal(record.anomalous, false)
+  assert.deepEqual(warnings, [])
+  await ctx.fiber.dispose()
+})
+
+test('content-freedom: no text, argument or path from the payload reaches any record, log line, error or count', async () => {
+  // Three sentinels in the shapes a real session carries: the human's text, a
+  // path, and a tool argument. None of them is something a diagnostic may keep.
+  const TEXT_SENTINEL = 'ZZTEXTSENTINEL9f3a1'
+  const PATH_SENTINEL = 'ZZPATHSENTINEL9f3a1/private/notes.txt'
+  const ARG_SENTINEL = 'ZZARGSENTINEL9f3a1'
+
+  const { ctx, harness } = await mountBase()
+  const lines = []
+  ctx.logger.exporter({
+    levels: { default: 4 },
+    export: (message) => { lines.push(formatLog(message.args)) },
+  })
+  await mountGuard(ctx)
+
+  const carried = createUserMessage({
+    content: [
+      { type: 'text', text: TEXT_SENTINEL },
+      { type: 'text', text: `read ${PATH_SENTINEL}` },
+      { type: 'text', text: `{"path":"${ARG_SENTINEL}"}` },
+    ],
+    source: { kind: 'user' },
+  })
+  const phantom = messageFrom('user', `${TEXT_SENTINEL} ${PATH_SENTINEL} ${ARG_SENTINEL}`)
+  appendAfterGuard(ctx, (messages) => [...messages, phantom])
+
+  const agent = await harness.create(SessionId('assembly-secret'))
+  agent.inbox.splice('next-turn', 0, 0, [carried])
+  await dispatch(ctx, agent, harness.claim(agent, 'next-turn', 1))
+
+  // Every sink this plugin owns, serialized whole.
+  const api = guardApi(ctx)
+  const haystack = JSON.stringify({
+    assembly: api.assembly(),
+    violations: api.violations(),
+    counts: api.counts(),
+    assemblyCounts: api.assemblyCounts(),
+    log: lines,
+  })
+  for (const sentinel of [TEXT_SENTINEL, PATH_SENTINEL, ARG_SENTINEL]) {
+    assert.equal(haystack.includes(sentinel), false, `no sink may carry ${sentinel}`)
+  }
+  // And the record is asserted to be metadata only, not merely observed to be.
+  const [record] = api.assembly()
+  assert.deepEqual(Object.keys(record).sort(), [
+    'added', 'addedAsUser', 'addedAt', 'addedEmpty', 'addedKinds',
+    'admitted', 'anomalous', 'at', 'claimed', 'dropped', 'outcome', 'sessionId', 'step', 'turn',
+  ])
+  assert.equal(record.anomalous, true, 'the arm really did carry content into the batch')
+  assert.ok(lines.length >= 1, 'the finding really was logged, so the log was really searched')
+  await ctx.fiber.dispose()
+})
+
+test('a kind that is not a slug is reported as unrecognized rather than echoed', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  appendAfterGuard(ctx, (messages) => [...messages, messageFrom('ZZTEXTSENTINEL9f3a1 is my kind')])
+  await oneStep(ctx, harness, 'assembly-kind')
+
+  const [record] = guardApi(ctx).assembly()
+  assert.deepEqual(record.addedKinds, ['unrecognized', BUILT_IN])
+  assert.equal(JSON.stringify(record).includes('ZZTEXTSENTINEL9f3a1'), false)
+  await ctx.fiber.dispose()
+})
+
+test('fail-open: a decision the audit cannot read never breaks the turn', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx)
+  // Unreadable to the *audit* specifically: `source` is well formed, so every
+  // other reader in the waterfall is satisfied, and `content` throws only for
+  // the code that counts it.
+  const hostile = {
+    id: 'hostile',
+    role: 'user',
+    source: { kind: 'user' },
+    get content() { throw new Error('audit probe: unreadable content') },
+  }
+  appendAfterGuard(ctx, (messages) => [...messages, hostile])
+  const { decision } = await oneStep(ctx, harness, 'assembly-failopen')
+
+  assert.equal(decision.messages.includes(hostile), true, 'the loop gets its own decision back untouched')
+  assert.deepEqual(guardApi(ctx).assemblyCounts(), { steps: 0, anomalous: 0, errors: 1 })
+  await ctx.fiber.dispose()
+})
+
+test('the record bound drops the oldest while the totals keep counting', async () => {
+  const { ctx, harness } = await mountBase()
+  await mountGuard(ctx, { assemblyLimit: 2 })
+  const agent = await harness.create(SessionId('assembly-bound'))
+  for (let turn = 1; turn <= 4; turn += 1) {
+    agent.inbox.splice('next-turn', 0, 0, [legalPrompt(`message ${turn}`)])
+    await dispatch(ctx, agent, harness.claim(agent, 'next-turn', turn), { turn })
+  }
+  const records = guardApi(ctx).assembly()
+  assert.equal(records.length, 2)
+  assert.deepEqual(records.map((record) => record.turn), [3, 4], 'oldest dropped first')
+  assert.equal(guardApi(ctx).assemblyCounts().steps, 4, 'the totals outlive the records')
+  await ctx.fiber.dispose()
+})

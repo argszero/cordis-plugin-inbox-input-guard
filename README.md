@@ -94,6 +94,41 @@ guard.reset()       // drop the records; the hooks stay installed
 
 Each violation is also logged at warn level, naming the session and the log seq.
 
+### Reading the assembly
+
+The same listener also keeps a record of what each step did to the batch, for
+the other half of the inbox question: a message the user never typed reaching a
+model request that the log does not hold
+([#11575](https://github.com/deepseek-ai/deepseek-harness/discussions/11575)).
+
+```js
+guard.assembly()        // [{ at, sessionId, turn, step, claimed, admitted, added,
+                        //    addedAt, addedKinds, addedAsUser, addedEmpty, dropped,
+                        //    outcome, anomalous }, …]
+guard.assemblyCounts()  // { steps, anomalous, errors }
+```
+
+A step is compared with itself, by identity: the claim the loop took from the
+inbox, and the decision the waterfall settled on. Anything the decision carries
+that the claim did not is an **addition** — it was manufactured during this
+step — and its `source.kind` says what it claims to be. Occurrences are counted,
+not membership, so one message handed back twice is one addition and shows up
+where it sits in the request.
+
+`anomalous: true` means one thing only: **a message was admitted as
+user-authored that the inbox never delivered.** A declared producer is not
+anomalous — the loop's own continuation appends `[...claimed, context]` and that
+context declares `source.kind: 'runtime-context'`, so it appears as an addition
+with `addedAsUser: 0`. The audit is loud only on the anomaly, once per step,
+naming the session, the turn, the step and the positions; a healthy step records
+silently.
+
+**No content is read.** A record carries counts, positions and a bounded producer
+slug. Message text, tool arguments, paths and `notice` summaries are never
+touched, so the record can be pasted into a report about a session whose text is
+private. A `source.kind` that is not a slug is reported as `unrecognized` rather
+than echoed.
+
 ## Honest boundaries
 
 - The durable `agent/inbox/spliced` record keeps whatever was spliced — a plugin
@@ -106,6 +141,21 @@ Each violation is also logged at warn level, naming the session and the log seq.
 - `report` mode re-observes the same untouched entry once per pass, so one bad
   entry appears twice there (at the claim and at the entry). That is the mode
   doing exactly what it says.
+- **The assembly audit observes; it does not prevent.** It runs around the
+  waterfall, so it can tell you that a step admitted text the inbox never
+  delivered, and where in the request that text sat — it cannot keep the text
+  out. Prevention is the shape half above, and even that only covers values that
+  are not messages at all; a well-formed message is a message.
+- **The built-in continuation is the same shape.** The loop appends its runtime
+  context at the fallback itself, so "a message that was never in the inbox" is
+  normal at every step, and `addedAsUser` is the only field that distinguishes a
+  producer declaring itself from text impersonating the human.
+- A step whose audit itself fails (a producer whose `content` accessor throws,
+  say) is counted in `assemblyCounts().errors` and changes nothing: the loop gets
+  its own decision back untouched. The whole audit is fail-open by construction.
+- Records are bounded (`assemblyLimit`, default 256, oldest dropped first) while
+  the totals keep counting every step, so a long session cannot grow this
+  without limit.
 
 The upstream fix is a shape check at the inbox write boundary, plus a check in
 `inboxProjectionSchema`, whose `z.custom<UserMessage>()` accepts any value on
